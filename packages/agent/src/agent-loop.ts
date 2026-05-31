@@ -213,7 +213,7 @@ const RLM_MAX_ITERATIONS = 12;
 const RLM_MAX_OUTPUT_CHARS = 10_000;
 const RLM_ACTION_PROMPT = `You are the recursive language model core for pi-rlm.
 
-You have an iterative runtime. At each step, return exactly one JSON object and no markdown.
+You have an iterative runtime. At each step, return exactly one JSON object and no markdown, prose, code fences, or native tool calls.
 State persists for this agent turn through the RLM history shown below. Use small steps: inspect with tools, observe output, then decide the next step.
 
 Actions:
@@ -268,16 +268,6 @@ async function runRlmTurn(
 		const actionText = await generateRlmAction(currentContext, config, history, iteration, signal, streamFn);
 		const action = parseRlmAction(actionText);
 		if (!action) {
-			await emitAssistantMessage(
-				createAssistantMessage(
-					`RLM step ${iteration + 1}: invalid action\n\nThe model did not return valid RLM JSON. Asking it to try again.`,
-					config,
-					"stop",
-				),
-				currentContext,
-				newMessages,
-				emit,
-			);
 			history.push({
 				reasoning: "The model did not return valid RLM JSON.",
 				action: actionText,
@@ -388,6 +378,7 @@ async function generateRlmAction(
 		buildRlmPrompt(context, config, history, iteration),
 		signal,
 		streamFn,
+		{ systemPrompt: RLM_ACTION_PROMPT, disableReasoning: true },
 	);
 }
 
@@ -451,6 +442,7 @@ async function runHiddenAssistantText(
 	prompt: string,
 	signal: AbortSignal | undefined,
 	streamFn?: StreamFn,
+	options: { systemPrompt?: string; disableReasoning?: boolean } = {},
 ): Promise<string> {
 	let messages = context.messages;
 	if (config.transformContext) {
@@ -464,10 +456,10 @@ async function runHiddenAssistantText(
 	const response = await streamFunction(
 		config.model,
 		{
-			systemPrompt: context.systemPrompt,
+			systemPrompt: options.systemPrompt ?? context.systemPrompt,
 			messages: [...llmMessages, hiddenPrompt],
 		},
-		{ ...config, apiKey: resolvedApiKey, signal },
+		{ ...config, apiKey: resolvedApiKey, signal, reasoning: options.disableReasoning ? undefined : config.reasoning },
 	);
 	for await (const _event of response) {
 		// Drain stream; final text is read from response.result().
@@ -476,29 +468,34 @@ async function runHiddenAssistantText(
 }
 
 function parseRlmAction(text: string): RlmAction | undefined {
-	const stripped = stripJsonFences(text);
-	const jsonText = extractJsonObject(stripped);
-	if (!jsonText) {
+	for (const jsonText of extractJsonObjects(stripJsonFences(text))) {
+		try {
+			const value = JSON.parse(jsonText) as unknown;
+			const action = parseRlmActionValue(value);
+			if (action) {
+				return action;
+			}
+		} catch {
+			// Keep scanning for another JSON object.
+		}
+	}
+	return undefined;
+}
+
+function parseRlmActionValue(value: unknown): RlmAction | undefined {
+	if (!isRecord(value) || typeof value.action !== "string") {
 		return undefined;
 	}
-	try {
-		const value = JSON.parse(jsonText) as unknown;
-		if (!isRecord(value) || typeof value.action !== "string") {
-			return undefined;
-		}
-		if (value.action === "submit" && typeof value.answer === "string") {
-			return { action: "submit", answer: value.answer, reasoning: optionalString(value.reasoning) };
-		}
-		if (value.action === "llm_query" && typeof value.prompt === "string") {
-			return { action: "llm_query", prompt: value.prompt, reasoning: optionalString(value.reasoning) };
-		}
-		if (value.action === "tool" && typeof value.tool === "string") {
-			return { action: "tool", tool: value.tool, args: value.args, reasoning: optionalString(value.reasoning) };
-		}
-		return undefined;
-	} catch {
-		return undefined;
+	if (value.action === "submit" && typeof value.answer === "string") {
+		return { action: "submit", answer: value.answer, reasoning: optionalString(value.reasoning) };
 	}
+	if (value.action === "llm_query" && typeof value.prompt === "string") {
+		return { action: "llm_query", prompt: value.prompt, reasoning: optionalString(value.reasoning) };
+	}
+	if (value.action === "tool" && typeof value.tool === "string") {
+		return { action: "tool", tool: value.tool, args: value.args, reasoning: optionalString(value.reasoning) };
+	}
+	return undefined;
 }
 
 function stripJsonFences(text: string): string {
@@ -512,13 +509,45 @@ function stripJsonFences(text: string): string {
 		.trim();
 }
 
-function extractJsonObject(text: string): string | undefined {
-	const start = text.indexOf("{");
-	const end = text.lastIndexOf("}");
-	if (start === -1 || end === -1 || end <= start) {
-		return undefined;
+function extractJsonObjects(text: string): string[] {
+	const objects: string[] = [];
+	let start = -1;
+	let depth = 0;
+	let inString = false;
+	let escaped = false;
+	for (let index = 0; index < text.length; index++) {
+		const char = text[index];
+		if (escaped) {
+			escaped = false;
+			continue;
+		}
+		if (char === "\\" && inString) {
+			escaped = true;
+			continue;
+		}
+		if (char === '"') {
+			inString = !inString;
+			continue;
+		}
+		if (inString) {
+			continue;
+		}
+		if (char === "{") {
+			if (depth === 0) {
+				start = index;
+			}
+			depth++;
+			continue;
+		}
+		if (char === "}" && depth > 0) {
+			depth--;
+			if (depth === 0 && start !== -1) {
+				objects.push(text.slice(start, index + 1));
+				start = -1;
+			}
+		}
 	}
-	return text.slice(start, end + 1);
+	return objects;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
