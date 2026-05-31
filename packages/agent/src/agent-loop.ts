@@ -5,7 +5,6 @@
 
 import {
 	type AssistantMessage,
-	type Context,
 	EventStream,
 	streamSimple,
 	type ToolResultMessage,
@@ -162,209 +161,513 @@ async function runLoop(
 ): Promise<void> {
 	let currentContext = initialContext;
 	let config = initialConfig;
-	let firstTurn = true;
-	// Check for steering messages at start (user may have typed while waiting)
-	let pendingMessages: AgentMessage[] = (await config.getSteeringMessages?.()) || [];
+	let firstRun = true;
 
-	// Outer loop: continues when queued follow-up messages arrive after agent would stop
 	while (true) {
-		let hasMoreToolCalls = true;
+		if (!firstRun) {
+			await emit({ type: "turn_start" });
+		}
+		firstRun = false;
 
-		// Inner loop: process tool calls and steering messages
-		while (hasMoreToolCalls || pendingMessages.length > 0) {
-			if (!firstTurn) {
-				await emit({ type: "turn_start" });
-			} else {
-				firstTurn = false;
-			}
-
-			// Process pending messages (inject before next assistant response)
-			if (pendingMessages.length > 0) {
-				for (const message of pendingMessages) {
-					await emit({ type: "message_start", message });
-					await emit({ type: "message_end", message });
-					currentContext.messages.push(message);
-					newMessages.push(message);
-				}
-				pendingMessages = [];
-			}
-
-			// Stream assistant response
-			const message = await streamAssistantResponse(currentContext, config, signal, emit, streamFn);
+		const pendingMessages = (await config.getSteeringMessages?.()) || [];
+		for (const message of pendingMessages) {
+			await emit({ type: "message_start", message });
+			await emit({ type: "message_end", message });
+			currentContext.messages.push(message);
 			newMessages.push(message);
+		}
 
-			if (message.stopReason === "error" || message.stopReason === "aborted") {
-				await emit({ type: "turn_end", message, toolResults: [] });
-				await emit({ type: "agent_end", messages: newMessages });
-				return;
-			}
+		const result = await runRlmTurn(currentContext, newMessages, config, signal, emit, streamFn);
+		currentContext = result.context;
+		config = result.config;
 
-			// Check for tool calls
-			const toolCalls = message.content.filter((c) => c.type === "toolCall");
+		await emit({ type: "turn_end", message: result.message, toolResults: result.toolResults });
 
-			const toolResults: ToolResultMessage[] = [];
-			hasMoreToolCalls = false;
-			if (toolCalls.length > 0) {
-				const executedToolBatch = await executeToolCalls(currentContext, message, config, signal, emit);
-				toolResults.push(...executedToolBatch.messages);
-				hasMoreToolCalls = !executedToolBatch.terminate;
-
-				for (const result of toolResults) {
-					currentContext.messages.push(result);
-					newMessages.push(result);
-				}
-			}
-
-			await emit({ type: "turn_end", message, toolResults });
-
-			const nextTurnContext = {
-				message,
-				toolResults,
+		if (
+			await config.shouldStopAfterTurn?.({
+				message: result.message,
+				toolResults: result.toolResults,
 				context: currentContext,
 				newMessages,
-			};
-			const nextTurnSnapshot = await config.prepareNextTurn?.(nextTurnContext);
-			if (nextTurnSnapshot) {
-				currentContext = nextTurnSnapshot.context ?? currentContext;
-				config = {
-					...config,
-					model: nextTurnSnapshot.model ?? config.model,
-					reasoning:
-						nextTurnSnapshot.thinkingLevel === undefined
-							? config.reasoning
-							: nextTurnSnapshot.thinkingLevel === "off"
-								? undefined
-								: nextTurnSnapshot.thinkingLevel,
-				};
-			}
-
-			if (
-				await config.shouldStopAfterTurn?.({
-					message,
-					toolResults,
-					context: currentContext,
-					newMessages,
-				})
-			) {
-				await emit({ type: "agent_end", messages: newMessages });
-				return;
-			}
-
-			pendingMessages = (await config.getSteeringMessages?.()) || [];
+			})
+		) {
+			await emit({ type: "agent_end", messages: newMessages });
+			return;
 		}
 
-		// Agent would stop here. Check for follow-up messages.
 		const followUpMessages = (await config.getFollowUpMessages?.()) || [];
-		if (followUpMessages.length > 0) {
-			// Set as pending so inner loop processes them
-			pendingMessages = followUpMessages;
-			continue;
+		if (followUpMessages.length === 0) {
+			await emit({ type: "agent_end", messages: newMessages });
+			return;
 		}
-
-		// No more messages, exit
-		break;
+		for (const message of followUpMessages) {
+			await emit({ type: "message_start", message });
+			await emit({ type: "message_end", message });
+			currentContext.messages.push(message);
+			newMessages.push(message);
+		}
 	}
-
-	await emit({ type: "agent_end", messages: newMessages });
 }
 
-/**
- * Stream an assistant response from the LLM.
- * This is where AgentMessage[] gets transformed to Message[] for the LLM.
- */
-async function streamAssistantResponse(
-	context: AgentContext,
-	config: AgentLoopConfig,
+const RLM_MAX_ITERATIONS = 12;
+const RLM_MAX_OUTPUT_CHARS = 10_000;
+const RLM_ACTION_PROMPT = `You are the recursive language model core for pi-rlm.
+
+You have an iterative runtime. At each step, return exactly one JSON object and no markdown, prose, code fences, or native tool calls.
+State persists for this agent turn through the RLM history shown below. Use small steps: inspect with tools, observe output, then decide the next step.
+
+Actions:
+{"action":"tool","tool":"read","args":{"path":"package.json"},"reasoning":"why this tool call is next"}
+{"action":"llm_query","prompt":"focused semantic question over known context","reasoning":"why a sub-query helps"}
+{"action":"submit","answer":"final user-facing response","reasoning":"why the task is complete"}
+
+Rules:
+- Use available tools by name when you need workspace information or file changes.
+- Do not invent tool results; wait for observations.
+- Call submit only when you have enough evidence or the task is impossible.
+- If a tool fails, inspect the observation and recover in the next step.`;
+
+type RlmAction =
+	| { action: "tool"; tool: string; args?: unknown; reasoning?: string }
+	| { action: "llm_query"; prompt: string; reasoning?: string }
+	| { action: "submit"; answer: string; reasoning?: string };
+
+type RlmHistoryEntry = {
+	reasoning: string;
+	action: string;
+	observation: string;
+};
+
+type RlmTurnResult = {
+	context: AgentContext;
+	config: AgentLoopConfig;
+	message: AssistantMessage;
+	toolResults: ToolResultMessage[];
+};
+
+async function runRlmTurn(
+	initialContext: AgentContext,
+	newMessages: AgentMessage[],
+	initialConfig: AgentLoopConfig,
 	signal: AbortSignal | undefined,
 	emit: AgentEventSink,
 	streamFn?: StreamFn,
-): Promise<AssistantMessage> {
-	// Apply context transform if configured (AgentMessage[] → AgentMessage[])
+): Promise<RlmTurnResult> {
+	const currentContext = initialContext;
+	const config = initialConfig;
+	const history: RlmHistoryEntry[] = [];
+	const toolResults: ToolResultMessage[] = [];
+
+	for (let iteration = 0; iteration < RLM_MAX_ITERATIONS; iteration++) {
+		if (signal?.aborted) {
+			const message = createAssistantMessage("Operation aborted", config, "aborted", "Operation aborted");
+			await emitAssistantMessage(message, currentContext, newMessages, emit);
+			return { context: currentContext, config, message, toolResults };
+		}
+
+		const actionText = await generateRlmAction(currentContext, config, history, iteration, signal, streamFn);
+		const action = parseRlmAction(actionText);
+		if (!action) {
+			history.push({
+				reasoning: "The model did not return valid RLM JSON.",
+				action: actionText,
+				observation: "Return exactly one JSON object with action tool, llm_query, or submit.",
+			});
+			continue;
+		}
+
+		if (action.action === "submit") {
+			await emitAssistantMessage(
+				createAssistantMessage(formatRlmActionTrace(iteration, action), config, "stop"),
+				currentContext,
+				newMessages,
+				emit,
+			);
+			const message = createAssistantMessage(action.answer, config, "stop");
+			await emitAssistantMessage(message, currentContext, newMessages, emit);
+			return await prepareRlmNextTurn(currentContext, config, message, toolResults, newMessages);
+		}
+
+		if (action.action === "llm_query") {
+			await emitAssistantMessage(
+				createAssistantMessage(formatRlmActionTrace(iteration, action), config, "stop"),
+				currentContext,
+				newMessages,
+				emit,
+			);
+			const observation = await runRlmSubQuery(currentContext, config, action.prompt, signal, streamFn);
+			history.push({
+				reasoning: action.reasoning ?? "",
+				action: JSON.stringify(action),
+				observation: truncateRlmOutput(observation),
+			});
+			continue;
+		}
+
+		const syntheticAssistant = createToolCallAssistantMessage(action, config, iteration);
+		await emitAssistantMessage(syntheticAssistant, currentContext, newMessages, emit);
+		const executedToolBatch = await executeToolCalls(currentContext, syntheticAssistant, config, signal, emit);
+		for (const result of executedToolBatch.messages) {
+			currentContext.messages.push(result);
+			newMessages.push(result);
+			toolResults.push(result);
+		}
+		history.push({
+			reasoning: action.reasoning ?? "",
+			action: JSON.stringify(action),
+			observation: truncateRlmOutput(formatToolResultsForRlm(executedToolBatch.messages)),
+		});
+
+		if (executedToolBatch.terminate) {
+			const message = createAssistantMessage("Task completed.", config, "stop");
+			await emitAssistantMessage(message, currentContext, newMessages, emit);
+			return await prepareRlmNextTurn(currentContext, config, message, toolResults, newMessages);
+		}
+	}
+
+	const fallback = await generateRlmFallbackAnswer(currentContext, config, history, signal, streamFn);
+	const message = createAssistantMessage(fallback, config, "stop");
+	await emitAssistantMessage(message, currentContext, newMessages, emit);
+	return await prepareRlmNextTurn(currentContext, config, message, toolResults, newMessages);
+}
+
+async function prepareRlmNextTurn(
+	currentContext: AgentContext,
+	config: AgentLoopConfig,
+	message: AssistantMessage,
+	toolResults: ToolResultMessage[],
+	newMessages: AgentMessage[],
+): Promise<RlmTurnResult> {
+	const nextTurnSnapshot = await config.prepareNextTurn?.({
+		message,
+		toolResults,
+		context: currentContext,
+		newMessages,
+	});
+	if (!nextTurnSnapshot) {
+		return { context: currentContext, config, message, toolResults };
+	}
+	return {
+		context: nextTurnSnapshot.context ?? currentContext,
+		config: {
+			...config,
+			model: nextTurnSnapshot.model ?? config.model,
+			reasoning:
+				nextTurnSnapshot.thinkingLevel === undefined
+					? config.reasoning
+					: nextTurnSnapshot.thinkingLevel === "off"
+						? undefined
+						: nextTurnSnapshot.thinkingLevel,
+		},
+		message,
+		toolResults,
+	};
+}
+
+async function generateRlmAction(
+	context: AgentContext,
+	config: AgentLoopConfig,
+	history: RlmHistoryEntry[],
+	iteration: number,
+	signal: AbortSignal | undefined,
+	streamFn?: StreamFn,
+): Promise<string> {
+	return runHiddenAssistantText(
+		context,
+		config,
+		buildRlmPrompt(context, config, history, iteration),
+		signal,
+		streamFn,
+		{ systemPrompt: RLM_ACTION_PROMPT, disableReasoning: true },
+	);
+}
+
+async function runRlmSubQuery(
+	context: AgentContext,
+	config: AgentLoopConfig,
+	prompt: string,
+	signal: AbortSignal | undefined,
+	streamFn?: StreamFn,
+): Promise<string> {
+	return runHiddenAssistantText(
+		context,
+		config,
+		`Answer this focused sub-query using the visible conversation context. Return only the answer.\n\n${prompt}`,
+		signal,
+		streamFn,
+	);
+}
+
+async function generateRlmFallbackAnswer(
+	context: AgentContext,
+	config: AgentLoopConfig,
+	history: RlmHistoryEntry[],
+	signal: AbortSignal | undefined,
+	streamFn?: StreamFn,
+): Promise<string> {
+	return runHiddenAssistantText(
+		context,
+		config,
+		`The RLM loop reached its iteration limit. Based on the trajectory, write the best final user-facing answer now.\n\n${formatRlmHistory(history)}`,
+		signal,
+		streamFn,
+	);
+}
+
+function buildRlmPrompt(
+	context: AgentContext,
+	config: AgentLoopConfig,
+	history: RlmHistoryEntry[],
+	iteration: number,
+): string {
+	const toolDocs = (context.tools ?? []).map((tool) => `- ${tool.name}: ${tool.description}`).join("\n");
+	return `${RLM_ACTION_PROMPT}\n\nIteration: ${iteration + 1}/${RLM_MAX_ITERATIONS}\nModel: ${config.model.provider}/${config.model.id}\nAvailable tools:\n${toolDocs || "(none)"}\n\nRLM history:\n${formatRlmHistory(history)}\n\nReturn the next JSON action.`;
+}
+
+function formatRlmHistory(history: RlmHistoryEntry[]): string {
+	if (history.length === 0) {
+		return "No RLM steps yet.";
+	}
+	return history
+		.map(
+			(entry, index) =>
+				`Step ${index + 1}\nReasoning: ${entry.reasoning}\nAction: ${entry.action}\nObservation:\n${entry.observation}`,
+		)
+		.join("\n\n");
+}
+
+async function runHiddenAssistantText(
+	context: AgentContext,
+	config: AgentLoopConfig,
+	prompt: string,
+	signal: AbortSignal | undefined,
+	streamFn?: StreamFn,
+	options: { systemPrompt?: string; disableReasoning?: boolean } = {},
+): Promise<string> {
 	let messages = context.messages;
 	if (config.transformContext) {
 		messages = await config.transformContext(messages, signal);
 	}
-
-	// Convert to LLM-compatible messages (AgentMessage[] → Message[])
 	const llmMessages = await config.convertToLlm(messages);
-
-	// Build LLM context
-	const llmContext: Context = {
-		systemPrompt: context.systemPrompt,
-		messages: llmMessages,
-		tools: context.tools,
-	};
-
+	const hiddenPrompt = { role: "user", content: prompt, timestamp: Date.now() } as const;
 	const streamFunction = streamFn || streamSimple;
-
-	// Resolve API key (important for expiring tokens)
 	const resolvedApiKey =
 		(config.getApiKey ? await config.getApiKey(config.model.provider) : undefined) || config.apiKey;
+	const response = await streamFunction(
+		config.model,
+		{
+			systemPrompt: options.systemPrompt ?? context.systemPrompt,
+			messages: [...llmMessages, hiddenPrompt],
+		},
+		{ ...config, apiKey: resolvedApiKey, signal, reasoning: options.disableReasoning ? undefined : config.reasoning },
+	);
+	for await (const _event of response) {
+		// Drain stream; final text is read from response.result().
+	}
+	return assistantText(await response.result());
+}
 
-	const response = await streamFunction(config.model, llmContext, {
-		...config,
-		apiKey: resolvedApiKey,
-		signal,
-	});
+function parseRlmAction(text: string): RlmAction | undefined {
+	for (const jsonText of extractJsonObjects(stripJsonFences(text))) {
+		try {
+			const value = JSON.parse(jsonText) as unknown;
+			const action = parseRlmActionValue(value);
+			if (action) {
+				return action;
+			}
+		} catch {
+			// Keep scanning for another JSON object.
+		}
+	}
+	return undefined;
+}
 
-	let partialMessage: AssistantMessage | null = null;
-	let addedPartial = false;
+function parseRlmActionValue(value: unknown): RlmAction | undefined {
+	if (!isRecord(value) || typeof value.action !== "string") {
+		return undefined;
+	}
+	if (value.action === "submit" && typeof value.answer === "string") {
+		return { action: "submit", answer: value.answer, reasoning: optionalString(value.reasoning) };
+	}
+	if (value.action === "llm_query" && typeof value.prompt === "string") {
+		return { action: "llm_query", prompt: value.prompt, reasoning: optionalString(value.reasoning) };
+	}
+	if (value.action === "tool" && typeof value.tool === "string") {
+		return { action: "tool", tool: value.tool, args: value.args, reasoning: optionalString(value.reasoning) };
+	}
+	return undefined;
+}
 
-	for await (const event of response) {
-		switch (event.type) {
-			case "start":
-				partialMessage = event.partial;
-				context.messages.push(partialMessage);
-				addedPartial = true;
-				await emit({ type: "message_start", message: { ...partialMessage } });
-				break;
+function stripJsonFences(text: string): string {
+	const trimmed = text.trim();
+	if (!trimmed.startsWith("```")) {
+		return trimmed;
+	}
+	return trimmed
+		.replace(/^```(?:json)?\s*/i, "")
+		.replace(/```$/i, "")
+		.trim();
+}
 
-			case "text_start":
-			case "text_delta":
-			case "text_end":
-			case "thinking_start":
-			case "thinking_delta":
-			case "thinking_end":
-			case "toolcall_start":
-			case "toolcall_delta":
-			case "toolcall_end":
-				if (partialMessage) {
-					partialMessage = event.partial;
-					context.messages[context.messages.length - 1] = partialMessage;
-					await emit({
-						type: "message_update",
-						assistantMessageEvent: event,
-						message: { ...partialMessage },
-					});
-				}
-				break;
-
-			case "done":
-			case "error": {
-				const finalMessage = await response.result();
-				if (addedPartial) {
-					context.messages[context.messages.length - 1] = finalMessage;
-				} else {
-					context.messages.push(finalMessage);
-				}
-				if (!addedPartial) {
-					await emit({ type: "message_start", message: { ...finalMessage } });
-				}
-				await emit({ type: "message_end", message: finalMessage });
-				return finalMessage;
+function extractJsonObjects(text: string): string[] {
+	const objects: string[] = [];
+	let start = -1;
+	let depth = 0;
+	let inString = false;
+	let escaped = false;
+	for (let index = 0; index < text.length; index++) {
+		const char = text[index];
+		if (escaped) {
+			escaped = false;
+			continue;
+		}
+		if (char === "\\" && inString) {
+			escaped = true;
+			continue;
+		}
+		if (char === '"') {
+			inString = !inString;
+			continue;
+		}
+		if (inString) {
+			continue;
+		}
+		if (char === "{") {
+			if (depth === 0) {
+				start = index;
+			}
+			depth++;
+			continue;
+		}
+		if (char === "}" && depth > 0) {
+			depth--;
+			if (depth === 0 && start !== -1) {
+				objects.push(text.slice(start, index + 1));
+				start = -1;
 			}
 		}
 	}
+	return objects;
+}
 
-	const finalMessage = await response.result();
-	if (addedPartial) {
-		context.messages[context.messages.length - 1] = finalMessage;
-	} else {
-		context.messages.push(finalMessage);
-		await emit({ type: "message_start", message: { ...finalMessage } });
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function optionalString(value: unknown): string | undefined {
+	return typeof value === "string" ? value : undefined;
+}
+
+function createToolCallAssistantMessage(
+	action: Extract<RlmAction, { action: "tool" }>,
+	config: AgentLoopConfig,
+	iteration: number,
+): AssistantMessage {
+	const args = isRecord(action.args) ? action.args : {};
+	return {
+		...createAssistantMessage("", config, "toolUse"),
+		content: [
+			{ type: "text", text: formatRlmActionTrace(iteration, action) },
+			{
+				type: "toolCall",
+				id: `rlm_${Date.now()}_${Math.random().toString(36).slice(2)}`,
+				name: action.tool,
+				arguments: args,
+			},
+		],
+	};
+}
+
+function formatRlmActionTrace(iteration: number, action: RlmAction): string {
+	if (action.action === "submit") {
+		return `RLM step ${iteration + 1}: submit final answer\n\nReasoning: ${action.reasoning ?? ""}\n\nJS REPL code:\n\`\`\`js\nawait submit(${JSON.stringify(action.answer)});\n\`\`\``;
 	}
-	await emit({ type: "message_end", message: finalMessage });
-	return finalMessage;
+	if (action.action === "llm_query") {
+		return `RLM step ${iteration + 1}: llm_query\n\nReasoning: ${action.reasoning ?? ""}\n\nJS REPL code:\n\`\`\`js\nconst result = await llmQuery(${JSON.stringify(action.prompt)});\nconsole.log(result);\n\`\`\``;
+	}
+	return `RLM step ${iteration + 1}: tool ${action.tool}\n\nReasoning: ${action.reasoning ?? ""}\n\nJS REPL code:\n\`\`\`js\nconst result = await tools.${action.tool}(${JSON.stringify(action.args ?? {}, null, 2)});\nconsole.log(result);\n\`\`\``;
+}
+
+function createAssistantMessage(
+	text: string,
+	config: AgentLoopConfig,
+	stopReason: AssistantMessage["stopReason"],
+	errorMessage?: string,
+): AssistantMessage {
+	return {
+		role: "assistant",
+		content: text ? [{ type: "text", text }] : [],
+		api: config.model.api,
+		provider: config.model.provider,
+		model: config.model.id,
+		usage: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason,
+		errorMessage,
+		timestamp: Date.now(),
+	};
+}
+
+async function emitAssistantMessage(
+	message: AssistantMessage,
+	context: AgentContext,
+	newMessages: AgentMessage[],
+	emit: AgentEventSink,
+): Promise<void> {
+	context.messages.push(message);
+	newMessages.push(message);
+	await emit({ type: "message_start", message: { ...message } });
+	if (message.content.some((content) => content.type === "text")) {
+		await emit({
+			type: "message_update",
+			message: { ...message },
+			assistantMessageEvent: { type: "text_start", contentIndex: 0, partial: message },
+		});
+		const text = assistantText(message);
+		await emit({
+			type: "message_update",
+			message: { ...message },
+			assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: text, partial: message },
+		});
+		await emit({
+			type: "message_update",
+			message: { ...message },
+			assistantMessageEvent: { type: "text_end", contentIndex: 0, content: text, partial: message },
+		});
+	}
+	await emit({ type: "message_end", message });
+}
+
+function assistantText(message: AssistantMessage): string {
+	return message.content
+		.filter((content) => content.type === "text")
+		.map((content) => content.text)
+		.join("");
+}
+
+function formatToolResultsForRlm(messages: ToolResultMessage[]): string {
+	return messages
+		.map((message) => {
+			const content = message.content
+				.map((item) => (item.type === "text" ? item.text : `[image: ${item.mimeType}]`))
+				.join("\n");
+			return `${message.toolName} ${message.isError ? "errored" : "returned"}:\n${content}`;
+		})
+		.join("\n\n");
+}
+
+function truncateRlmOutput(output: string): string {
+	if (output.length <= RLM_MAX_OUTPUT_CHARS) {
+		return output;
+	}
+	const half = Math.floor(RLM_MAX_OUTPUT_CHARS / 2);
+	return `${output.slice(0, half)}\n\n... (${output.length - RLM_MAX_OUTPUT_CHARS} characters omitted) ...\n\n${output.slice(-half)}`;
 }
 
 /**
