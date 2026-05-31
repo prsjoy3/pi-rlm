@@ -287,6 +287,12 @@ async function runRlmTurn(
 		}
 
 		if (action.action === "submit") {
+			await emitAssistantMessage(
+				createAssistantMessage(formatRlmActionTrace(iteration, action), config, "stop"),
+				currentContext,
+				newMessages,
+				emit,
+			);
 			const message = createAssistantMessage(action.answer, config, "stop");
 			await emitAssistantMessage(message, currentContext, newMessages, emit);
 			return await prepareRlmNextTurn(currentContext, config, message, toolResults, newMessages);
@@ -545,12 +551,12 @@ function createToolCallAssistantMessage(
 
 function formatRlmActionTrace(iteration: number, action: RlmAction): string {
 	if (action.action === "submit") {
-		return `RLM step ${iteration + 1}: submit final answer\n\nReasoning: ${action.reasoning ?? ""}`;
+		return `RLM step ${iteration + 1}: submit final answer\n\nReasoning: ${action.reasoning ?? ""}\n\nJS REPL code:\n\`\`\`js\nawait submit(${JSON.stringify(action.answer)});\n\`\`\``;
 	}
 	if (action.action === "llm_query") {
-		return `RLM step ${iteration + 1}: llm_query\n\nReasoning: ${action.reasoning ?? ""}\n\nPrompt:\n${action.prompt}`;
+		return `RLM step ${iteration + 1}: llm_query\n\nReasoning: ${action.reasoning ?? ""}\n\nJS REPL code:\n\`\`\`js\nconst result = await llmQuery(${JSON.stringify(action.prompt)});\nconsole.log(result);\n\`\`\``;
 	}
-	return `RLM step ${iteration + 1}: tool ${action.tool}\n\nReasoning: ${action.reasoning ?? ""}\n\nArguments:\n${JSON.stringify(action.args ?? {}, null, 2)}`;
+	return `RLM step ${iteration + 1}: tool ${action.tool}\n\nReasoning: ${action.reasoning ?? ""}\n\nJS REPL code:\n\`\`\`js\nconst result = await tools.${action.tool}(${JSON.stringify(action.args ?? {}, null, 2)});\nconsole.log(result);\n\`\`\``;
 }
 
 function createAssistantMessage(
