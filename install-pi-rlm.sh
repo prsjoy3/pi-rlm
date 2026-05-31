@@ -22,8 +22,11 @@ cd "$REPO_DIR"
 echo "Installing dependencies..."
 npm install --ignore-scripts
 
-echo "Building pi-rlm..."
-npm run build
+echo "Building pi-rlm without fetching remote model metadata..."
+(cd packages/tui && npm run build)
+(cd packages/ai && ../../node_modules/.bin/tsgo -p tsconfig.build.json)
+(cd packages/agent && npm run build)
+(cd packages/coding-agent && npm run build)
 
 mkdir -p "$BIN_DIR"
 cat > "$BIN_DIR/$BIN_NAME" <<EOF
